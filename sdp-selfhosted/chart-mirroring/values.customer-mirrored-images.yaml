@@ -1,0 +1,207 @@
+## =============================================================================
+## Semarchy Data Platform — customer values.yaml
+##
+## Based on the official Azure starter values:
+##   https://docs.semarchy.com/assets/files/values.azure-*.yaml
+##
+## PLUS a "Local registry / image mirroring" section (see the clearly marked
+## block below) that repoints EVERY container image from the Semarchy source
+## registry (registry.na.semarchy.net/semarchy-release/...) to a local
+## Artifactory mirror, so pods pull only from the local registry.
+##
+## Assumes images were mirrored preserving their path, e.g. with
+## mirror-semarchy-chart.sh:
+##   registry.na.semarchy.net/semarchy-release/docker-dm:1.12.1
+##     ->  <YOUR_LOCAL_REGISTRY>/semarchy-release/docker-dm:1.12.1
+##
+## Replace every <YOUR_...> placeholder before use.
+## =============================================================================
+
+## ------------------------------------------------------------------ Global ---
+global:
+    # `global.domain` is the main DNS domain used for all ingress hosts and for app access.
+    # When performing a local installation, declare this domain in /etc/hosts as well.
+    # Example: platform.company.net
+    domain: '<YOUR_GLOBAL_DOMAIN>'
+    # Protocol used for external URLs
+    externalProtocol: 'https'
+    license:
+        # Your license key for the Semarchy Data Platform
+        body: '<YOUR_LICENSE_KEY_HERE>'
+    smartReload:
+        enabled: false
+    searchEngine:
+        type: elasticsearch
+
+    ## =========================================================================
+    ## >>> LOCAL REGISTRY / IMAGE MIRRORING <<<
+    ## -------------------------------------------------------------------------
+    ## `global.image.registry` is prepended to nearly every image in the chart
+    ## and its sub-charts (it is used as
+    ##   {{ .Values.global.image.registry }}/{{ .Values.global.image.repository }}/<image>
+    ## and by the semarchy-common image helper). Point it at your local
+    ## registry BASE (host + any path prefix) where the mirror lives.
+    ##
+    ## Set it to the same base you passed to the mirror script as --target-repo.
+    ## Examples:
+    ##   registry: 'artifactory.company.com/semarchy'
+    ##   registry: 'myregistry.azurecr.io'          # if mirrored to ACR root
+    ##
+    ## Keep `repository: semarchy-release` — the mirror preserves that path
+    ## segment (…/semarchy-release/…), so the default value still resolves.
+    ##
+    ## This single override covers 18 of the 20 images. The 2 images that hard-code
+    ## the source registry (dm.secretManager and reloader) are overridden further
+    ## down in this file — search for "HARD-CODED IMAGE OVERRIDE".
+    ## =========================================================================
+    image:
+        registry: '<YOUR_LOCAL_REGISTRY>'      # e.g. artifactory.company.com/semarchy
+        repository: 'semarchy-release'
+
+    ## Credentials to pull from the local registry. Create this secret in the
+    ## release namespace beforehand, e.g.:
+    ##   kubectl create secret docker-registry local-registry \
+    ##     --docker-server=<YOUR_LOCAL_REGISTRY_HOST> \
+    ##     --docker-username=<USER> --docker-password=<TOKEN> -n <NAMESPACE>
+    imagePullSecrets:
+        - name: '<YOUR_LOCAL_REGISTRY_PULL_SECRET>'   # e.g. local-registry
+
+## ------------------------------------------------------------ Tenant setup ---
+tenant-settings:
+    isSelfHosted: true
+    user_creation:
+        # Email address of the first admin user
+        email: '<YOUR_EMAIL_ADDRESS>'
+        # Given name of the first admin user
+        firstname: '<YOUR_FIRSTNAME>'
+        # Family name of the first admin user
+        lastname: '<YOUR_LASTNAME>'
+
+## -------------------------------------------------------------- Semarchy IAM -
+semarchy-iam:
+    keycloak:
+        config:
+            spi:
+                # Azure Event Hubs uses PLAIN mechanism (default is SCRAM-SHA-512)
+                eventsListenerKafkaEventListenerPropertiesSaslMechanism: 'PLAIN'
+        ingresses:
+            ingress:
+                - name: sdp-keycloak
+                  # Class name of the ingress provider. Example: "nginx" or "traefik"
+                  className: '<YOUR_INGRESS_CLASS_NAME>'
+                  tls:
+                      secretName: <TLS_CERTIFICATE_ROOT>
+                      hostname: '<YOUR_GLOBAL_DOMAIN>'
+
+## -------------------------------------------------------------- Log Explorer -
+log-explorer:
+    ingress:
+        className: '<YOUR_INGRESS_CLASS_NAME>'
+        hosts:
+            - host: 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+              paths:
+                - path: /log-explorer
+                  pathType: ImplementationSpecific
+        tls:
+            - secretName: <TLS_CERTIFICATE_SUBDOMAIN>
+              hosts:
+                  - 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+
+## -------------------------------------------------------------- User Profile -
+user-profile:
+    ingress:
+        className: '<YOUR_INGRESS_CLASS_NAME>'
+        hosts:
+            - host: 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+              paths:
+                - path: /user-profile
+                  pathType: ImplementationSpecific
+        tls:
+            - secretName: <TLS_CERTIFICATE_SUBDOMAIN>
+              hosts:
+                  - 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+
+## ---------------------------------------------------------------- Site Admin -
+site-admin:
+    ingress:
+        className: '<YOUR_INGRESS_CLASS_NAME>'
+        hosts:
+            - host: 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+              paths:
+                - path: /site-admin
+                  pathType: ImplementationSpecific
+        tls:
+            - secretName: <TLS_CERTIFICATE_SUBDOMAIN>
+              hosts:
+                  - 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+
+## ------------------------------------------------------------------- Welcome -
+welcome:
+    ingress:
+        className: '<YOUR_INGRESS_CLASS_NAME>'
+        hosts:
+            - host: 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+              paths:
+                - path: /
+                  pathType: ImplementationSpecific
+        tls:
+            - secretName: <TLS_CERTIFICATE_SUBDOMAIN>
+              hosts:
+                  - 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+
+## ---------------------------------------------------------- Data Management --
+dm:
+    kafka:
+        # Azure Event Hubs uses PLAIN mechanism (default is SCRAM-SHA-512)
+        userEventSaslMechanism: PLAIN
+
+    ## === HARD-CODED IMAGE OVERRIDE (1 of 2) ==================================
+    ## dm.secretManager.image.repository hard-codes the FULL source path
+    ## (registry.na.semarchy.net/semarchy-release/docker-secret-manager) and does
+    ## NOT honor global.image.registry, so it must be repointed explicitly.
+    ## Keep the tag managed by the chart; only the repository (registry+path) changes.
+    ## =========================================================================
+    secretManager:
+        image:
+            repository: '<YOUR_LOCAL_REGISTRY>/semarchy-release/docker-secret-manager'
+
+    core:
+        ingress:
+            # Class name of the ingress provider. Example: "nginx" or "traefik"
+            className: '<YOUR_INGRESS_CLASS_NAME>'
+            hosts:
+                # Hostname for the Data Management core service. Example: selfhosted.platform.company.net
+                - host: 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+                  paths:
+                    - path: /dm
+                      pathType: ImplementationSpecific
+            tls:
+                - secretName: <TLS_CERTIFICATE_SUBDOMAIN>
+                  hosts:
+                      - 'selfhosted.<YOUR_GLOBAL_DOMAIN>'
+        active:
+            livenessProbe:
+                # Initial delay for liveness probe (seconds)
+                initialDelaySeconds: 100
+            readinessProbe:
+                # Initial delay for readiness probe (seconds)
+                initialDelaySeconds: 100
+        passive:
+            service:
+                annotations:
+                    # You need annotations for sticky sessions, Example annotations with "traefik".
+                    traefik.ingress.kubernetes.io/service.sticky.cookie: 'true'
+                    traefik.ingress.kubernetes.io/service.sticky.cookie.name: 'route'
+                    traefik.ingress.kubernetes.io/service.sticky.cookie.secure: 'true'
+                    traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: 'true'
+
+## ------------------------------------------------------------------ Reloader -
+## === HARD-CODED IMAGE OVERRIDE (2 of 2) ======================================
+## The reloader sub-chart cannot build its image from global values, so its
+## repository is hard-coded to registry.na.semarchy.net/... in the chart.
+## Repoint it to the local mirror. Only relevant when
+## global.smartReload.reloader.install is true (Reloader is installed).
+## =============================================================================
+reloader:
+    image:
+        repository: '<YOUR_LOCAL_REGISTRY>/semarchy-release/mirror/stakater/reloader'
