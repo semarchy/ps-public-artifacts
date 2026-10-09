@@ -155,15 +155,16 @@ dm:
         # Azure Event Hubs uses PLAIN mechanism (default is SCRAM-SHA-512)
         userEventSaslMechanism: PLAIN
 
-    ## === HARD-CODED IMAGE OVERRIDE (1 of 2) ==================================
+    ## === HARD-CODED IMAGE OVERRIDE (1 of 2) FOR VERSIONS BELOW 1.4.1==================================
     ## dm.secretManager.image.repository hard-codes the FULL source path
     ## (registry.na.semarchy.net/semarchy-release/docker-secret-manager) and does
     ## NOT honor global.image.registry, so it must be repointed explicitly.
     ## Keep the tag managed by the chart; only the repository (registry+path) changes.
     ## =========================================================================
-    secretManager:
-        image:
-            repository: '<YOUR_LOCAL_REGISTRY>/semarchy-release/docker-secret-manager'
+    ## UNCOMMENT FOR VERSIONS BELOW  1.4.1
+    ## secretManager:
+    ##     image:
+    ##         repository: '<YOUR_LOCAL_REGISTRY>/semarchy-release/docker-secret-manager'
 
     core:
         ingress:
