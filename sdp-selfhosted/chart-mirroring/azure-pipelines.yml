@@ -24,7 +24,7 @@ pr: none
 
 parameters:
   - name: chartVersion
-    displayName: 'Chart version to mirror (e.g. 1.3.0)'
+    displayName: 'Chart version to mirror (e.g. 1.4.2)'
     type: string
   - name: targetRepo
     displayName: 'Target registry repo (host/path, e.g. artifactory.corp.com/semarchy)'
@@ -37,11 +37,19 @@ parameters:
     displayName: 'Dry run (plan only, copy nothing)'
     type: boolean
     default: false
+  - name: skipExisting
+    displayName: 'Skip images already in the target (faster re-runs)'
+    type: boolean
+    default: true
 
 variables:
   - group: semarchy-mirror-creds          # provides SRC_HELM_USER/KEY, TGT_HELM_USER/KEY (secret)
   - name: scriptPath
     value: 'mirror-semarchy-chart.sh'
+  # Pin a Helm 3 release for reproducible runs ('latest' may resolve to a new
+  # major version). Any 3.8+ release works.
+  - name: helmVersion
+    value: 'v3.16.4'
   # Give helm and skopeo a shared, writable auth file so both logins land in one
   # place and skopeo can reuse the helm credentials.
   - name: HELM_REGISTRY_CONFIG
@@ -56,7 +64,7 @@ steps:
   - task: HelmInstaller@1
     displayName: 'Install Helm'
     inputs:
-      helmVersionToInstall: 'latest'
+      helmVersionToInstall: '$(helmVersion)'
 
   - script: |
       set -euo pipefail
@@ -71,9 +79,9 @@ steps:
 
   - script: |
       set -euo pipefail
-      # Ensure the shared auth file exists (helm writes to HELM_REGISTRY_CONFIG).
+      # Ensure the shared auth file exists and is valid JSON.
       mkdir -p "$(dirname "$HELM_REGISTRY_CONFIG")"
-      : > "$HELM_REGISTRY_CONFIG"
+      [ -s "$HELM_REGISTRY_CONFIG" ] || echo '{}' > "$HELM_REGISTRY_CONFIG"
 
       echo "Logging in to source registry: ${SOURCE_REGISTRY}"
       echo "$SRC_HELM_KEY" | helm registry login "${SOURCE_REGISTRY}" \
@@ -96,19 +104,30 @@ steps:
   - script: |
       set -euo pipefail
       chmod +x "$(scriptPath)"
-      DRY_FLAG=""
-      if [ "${DRY_RUN}" = "True" ] || [ "${DRY_RUN}" = "true" ]; then
-        DRY_FLAG="--dry-run"
-      fi
+      EXTRA_FLAGS=()
+      if [ "${DRY_RUN,,}" = "true" ]; then EXTRA_FLAGS+=(--dry-run); fi
+      if [ "${SKIP_EXISTING,,}" = "true" ]; then EXTRA_FLAGS+=(--skip-existing); fi
+      mkdir -p "$(Build.ArtifactStagingDirectory)"
       ./$(scriptPath) \
-        --target-repo   "${TARGET_REPO}" \
-        --chart-version "${CHART_VERSION}" \
+        --target-repo     "${TARGET_REPO}" \
+        --chart-version   "${CHART_VERSION}" \
         --source-registry "${SOURCE_REGISTRY}" \
-        --authfile "${HELM_REGISTRY_CONFIG}" \
-        ${DRY_FLAG}
+        --authfile        "${HELM_REGISTRY_CONFIG}" \
+        --images-out      "$(Build.ArtifactStagingDirectory)/images-${CHART_VERSION}.txt" \
+        "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"
     displayName: 'Mirror chart + images'
     env:
       TARGET_REPO: ${{ parameters.targetRepo }}
       CHART_VERSION: ${{ parameters.chartVersion }}
       SOURCE_REGISTRY: ${{ parameters.sourceRegistry }}
       DRY_RUN: ${{ parameters.dryRun }}
+      SKIP_EXISTING: ${{ parameters.skipExisting }}
+
+  - publish: '$(Build.ArtifactStagingDirectory)'
+    artifact: 'mirrored-images-${{ parameters.chartVersion }}'
+    displayName: 'Publish image list'
+    condition: succeededOrFailed()
+
+  - script: rm -f "$HELM_REGISTRY_CONFIG"
+    displayName: 'Remove registry credentials'
+    condition: always()

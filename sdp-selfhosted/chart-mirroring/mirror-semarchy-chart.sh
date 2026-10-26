@@ -6,6 +6,8 @@
 # references from the Semarchy source registry into a local Artifactory (or any
 # OCI-compliant) target registry.
 #
+# Validated against chart versions: 1.3.0, 1.4.2
+#
 # What it does:
 #   1. `helm pull` the parent chart from the source OCI registry. The parent
 #      chart bundles all sub-charts inside its .tgz, so a single push mirrors
@@ -16,6 +18,9 @@
 #   3. `skopeo copy` each image from the source registry to the target registry,
 #      preserving its repository path (registry host is swapped for the target).
 #   4. `helm push` the chart .tgz to the target OCI registry.
+#   5. Self-check: re-render the chart pointed at the target registry and fail
+#      if any image still references the source registry (e.g. a newly
+#      hard-coded image) or was not mirrored.
 #
 # Prerequisites (assumed done before running, per pipeline design):
 #   * `helm registry login <source>`  (registry.na.semarchy.net)
@@ -27,6 +32,7 @@
 #
 # -----------------------------------------------------------------------------
 set -euo pipefail
+export LC_ALL=C   # stable sort order for comm
 
 # ------------------------------------------------------------------ defaults --
 SOURCE_REGISTRY="registry.na.semarchy.net"
@@ -39,8 +45,11 @@ VALUES_FILES=()                      # optional -f values overlays for the rende
 EXTRA_SETS=()                        # optional --set passthroughs for the render
 AUTHFILE="${HELM_REGISTRY_CONFIG:-$HOME/.config/helm/registry/config.json}"
 WORK_DIR=""                          # default: mktemp
+IMAGES_OUT=""                        # optional: copy the discovered image list here
 DRY_RUN="false"
 KEEP_WORKDIR="false"
+SKIP_EXISTING="false"
+SKIP_VERIFY="false"
 
 # Components that are optional/disabled by default. Enabling them makes the
 # render a SUPERSET so we mirror every image that could ever be deployed.
@@ -48,11 +57,19 @@ KEEP_WORKDIR="false"
 DEFAULT_SETS=(
   "well-known-service.enabled=true"
   "xdg.enabled=true"
-  "global.caCert.enabled=true"          # pulls in the Java truststore builder image
+  "global.caCert.enabled=true"          # pulls in the CA truststore builder image (1.4.x: mirror/ubi9/openjdk-21-runtime)
   "global.smartReload.reloader.install=true"
   "global.domain=mirror.example.com"        # harmless value so required() templates render
   "global.license.body=mirror-render-only"  # non-placeholder so the license template renders
 )
+
+# Image overrides that the chart cannot derive from global.image.registry.
+# Used by the self-check (step 5) to simulate a customer values overlay.
+# As of chart 1.4.2 only Reloader is hard-coded. dm.secretManager was fixed in
+# 1.4.1 and must NOT be overridden with a full path any more.
+hardcoded_override_sets() {
+  printf '%s\n' "reloader.image.repository=${TARGET_REPO}/semarchy-release/mirror/stakater/reloader"
+}
 
 # --------------------------------------------------------------------- utils --
 c_reset=$'\033[0m'; c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_blu=$'\033[36m'
@@ -73,7 +90,7 @@ Required:
   -t, --target-repo <repo>     Target registry base for images, e.g.
                                artifactory.corp.com/semarchy
                                (images land under <repo>/<original-path>)
-  -v, --chart-version <ver>    Chart version to mirror, e.g. 1.3.0
+  -v, --chart-version <ver>    Chart version to mirror, e.g. 1.4.2
 
 Options:
   -s, --source-registry <host> Source image registry (default: $SOURCE_REGISTRY)
@@ -88,11 +105,17 @@ Options:
       --authfile <path>        Docker/Helm auth file for skopeo
                                (default: $AUTHFILE)
       --work-dir <dir>         Working directory (default: a mktemp dir)
+      --images-out <file>      Write the discovered image list to <file>
+                               (useful as an audit trail / for change review)
+      --skip-existing          Skip images already present in the target
+                               (checked with 'skopeo inspect'); faster re-runs
+      --no-verify              Skip the post-mirror self-check (step 5)
       --keep                   Keep the working directory on exit
-      --dry-run                Print actions without pulling/copying/pushing
+      --dry-run                Print actions without copying/pushing
+                               (the chart is still pulled to discover images)
   -h, --help                   Show this help
 
-Prerequisites: run `helm registry login` for BOTH the source and target
+Prerequisites: run \`helm registry login\` for BOTH the source and target
 registries before invoking this script. Requires: helm, skopeo.
 EOF
 }
@@ -110,6 +133,9 @@ while [[ $# -gt 0 ]]; do
     --set)                  EXTRA_SETS+=("$2"); shift 2;;
     --authfile)             AUTHFILE="$2"; shift 2;;
     --work-dir)             WORK_DIR="$2"; shift 2;;
+    --images-out)           IMAGES_OUT="$2"; shift 2;;
+    --skip-existing)        SKIP_EXISTING="true"; shift;;
+    --no-verify)            SKIP_VERIFY="true"; shift;;
     --keep)                 KEEP_WORKDIR="true"; shift;;
     --dry-run)              DRY_RUN="true"; shift;;
     -h|--help)              usage; exit 0;;
@@ -120,10 +146,10 @@ done
 [[ -n "$TARGET_REPO"   ]] || { usage; die "Missing required --target-repo"; }
 [[ -n "$CHART_VERSION" ]] || { usage; die "Missing required --chart-version"; }
 
-# derive defaults that depend on other args
+# normalize first, then derive defaults that depend on other args
+TARGET_REPO="${TARGET_REPO%/}"
 SOURCE_CHART_REPO="${SOURCE_CHART_REPO:-oci://${SOURCE_REGISTRY}/semarchy}"
 CHART_TARGET_REPO="${CHART_TARGET_REPO:-oci://${TARGET_REPO}}"
-TARGET_REPO="${TARGET_REPO%/}"          # normalize trailing slash
 
 # ------------------------------------------------------------- dependency chk --
 for bin in helm skopeo; do
@@ -158,14 +184,23 @@ log "Chart      : ${CHART_NAME} ${CHART_VERSION}"
 log "Source     : ${SOURCE_CHART_REPO}/${CHART_NAME}  (images from ${SOURCE_REGISTRY})"
 log "Target repo: ${TARGET_REPO}   (chart -> ${CHART_TARGET_REPO})"
 log "Work dir   : ${WORK_DIR}"
-[[ "$DRY_RUN" == "true" ]] && warn "DRY-RUN: no data will be pulled, copied, or pushed."
+[[ "$DRY_RUN" == "true" ]] && warn "DRY-RUN: no image will be copied and the chart will not be pushed."
+
+# Extract every image reference from a rendered manifest on stdin.
+# Handles name:tag and name@sha256:digest, strips quotes, ignores unrendered templates.
+extract_images() {
+  grep -E '^[[:space:]]*-?[[:space:]]*image:[[:space:]]' \
+    | sed -E 's/^[[:space:]]*-?[[:space:]]*image:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//; s/[[:space:]]+$//' \
+    | grep -vE '(\{\{|^$)' \
+    | sort -u || true
+}
 
 # ================================================================ 1. pull =====
 CHART_TGZ="${WORK_DIR}/${CHART_NAME}-${CHART_VERSION}.tgz"
 log "Pulling chart from ${SOURCE_CHART_REPO}/${CHART_NAME} ..."
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "  helm pull ${SOURCE_CHART_REPO}/${CHART_NAME} --version ${CHART_VERSION} -d ${WORK_DIR}"
-  # For dry-run image discovery we still need a chart; try pulling read-only anyway.
+  # For dry-run image discovery we still need a chart; pulling is read-only.
   helm pull "${SOURCE_CHART_REPO}/${CHART_NAME}" --version "${CHART_VERSION}" -d "${WORK_DIR}" \
     || warn "Dry-run: could not pull chart; image discovery will be skipped."
 else
@@ -177,20 +212,16 @@ fi
 IMAGES_FILE="${WORK_DIR}/images.txt"
 : > "$IMAGES_FILE"
 
+render_args=()
 if [[ -f "$CHART_TGZ" ]]; then
   log "Rendering chart to discover images (helm template) ..."
   render_args=("$CHART_TGZ")
   for s in "${DEFAULT_SETS[@]}"; do render_args+=(--set "$s"); done
-  for s in "${EXTRA_SETS[@]}";  do render_args+=(--set "$s"); done
-  for f in "${VALUES_FILES[@]}"; do render_args+=(-f "$f"); done
+  for s in "${EXTRA_SETS[@]+"${EXTRA_SETS[@]}"}"; do render_args+=(--set "$s"); done
+  for f in "${VALUES_FILES[@]+"${VALUES_FILES[@]}"}"; do render_args+=(-f "$f"); done
 
-  # Extract every image reference. Handles name:tag and name@sha256:digest,
-  # strips quotes, ignores unrendered templates.
   helm template "${render_args[@]}" 2>"${WORK_DIR}/helm-template.err" \
-    | grep -E '^[[:space:]]*-?[[:space:]]*image:[[:space:]]' \
-    | sed -E 's/^[[:space:]]*-?[[:space:]]*image:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//; s/[[:space:]]+$//' \
-    | grep -vE '(\{\{|^$)' \
-    | sort -u > "$IMAGES_FILE" || true
+    | extract_images > "$IMAGES_FILE"
 
   if [[ ! -s "$IMAGES_FILE" ]]; then
     err "helm template produced no images. Render stderr:"
@@ -199,6 +230,18 @@ if [[ -f "$CHART_TGZ" ]]; then
   fi
   ok "Discovered $(wc -l < "$IMAGES_FILE") unique image(s)."
   sed 's/^/    /' "$IMAGES_FILE"
+
+  # Flag images that do not come from the source registry (would need a
+  # different set of credentials, and are usually a sign of a values override).
+  if grep -v "^${SOURCE_REGISTRY}/" "$IMAGES_FILE" > "${WORK_DIR}/foreign.txt"; then
+    warn "These images are NOT served by ${SOURCE_REGISTRY}:"
+    sed 's/^/    /' "${WORK_DIR}/foreign.txt" >&2
+  fi
+
+  if [[ -n "$IMAGES_OUT" ]]; then
+    cp "$IMAGES_FILE" "$IMAGES_OUT"
+    ok "Image list written to ${IMAGES_OUT}"
+  fi
 else
   warn "No chart tarball available; skipping image discovery."
 fi
@@ -220,6 +263,7 @@ rehome() {
 # ================================================== 3. copy images to target ==
 declare -a FAILED_IMAGES=()
 COPIED=0
+SKIPPED=0
 if [[ -s "$IMAGES_FILE" ]]; then
   log "Mirroring images to ${TARGET_REPO} ..."
   while IFS= read -r img; do
@@ -230,9 +274,15 @@ if [[ -s "$IMAGES_FILE" ]]; then
       COPIED=$((COPIED+1))
       continue
     fi
+    if [[ "$SKIP_EXISTING" == "true" ]] \
+       && skopeo inspect --raw "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "docker://${dst}" >/dev/null 2>&1; then
+      ok "already present, skipped: ${dst}"
+      SKIPPED=$((SKIPPED+1))
+      continue
+    fi
     log "copy: ${img}"
     log "  -> ${dst}"
-    if skopeo copy --all "${AUTH_ARGS[@]}" "docker://${img}" "docker://${dst}"; then
+    if skopeo copy --all "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "docker://${img}" "docker://${dst}"; then
       ok "mirrored ${dst}"
       COPIED=$((COPIED+1))
     else
@@ -256,14 +306,50 @@ if [[ -f "$CHART_TGZ" ]]; then
   fi
 fi
 
+# ================================================= 5. self-check (offline) =====
+# Re-render the same chart as a customer would deploy it from the mirror
+# (global.image.registry + known hard-coded overrides) and check that:
+#   a) no image still points at the source registry, and
+#   b) every rendered image is one we mirrored.
+VERIFY_STATUS="skipped"
+if [[ "$SKIP_VERIFY" != "true" && -f "$CHART_TGZ" && -s "$IMAGES_FILE" ]]; then
+  log "Self-check: rendering chart against ${TARGET_REPO} ..."
+  verify_args=("${render_args[@]}" --set "global.image.registry=${TARGET_REPO}")
+  while IFS= read -r s; do verify_args+=(--set "$s"); done < <(hardcoded_override_sets)
+
+  helm template "${verify_args[@]}" 2>"${WORK_DIR}/helm-verify.err" \
+    | extract_images > "${WORK_DIR}/images-target.txt"
+
+  while IFS= read -r img; do rehome "$img"; echo; done < "$IMAGES_FILE" \
+    | sort -u > "${WORK_DIR}/images-expected.txt"
+
+  VERIFY_STATUS="passed"
+  if grep -F "${SOURCE_REGISTRY}/" "${WORK_DIR}/images-target.txt" > "${WORK_DIR}/leftover.txt"; then
+    err "Images still pointing at ${SOURCE_REGISTRY} with only global.image.registry set:"
+    sed 's/^/    /' "${WORK_DIR}/leftover.txt" >&2
+    err "-> a per-component image.repository override is needed in your values overlay."
+    VERIFY_STATUS="failed"
+  fi
+  if comm -23 "${WORK_DIR}/images-target.txt" "${WORK_DIR}/images-expected.txt" \
+       | grep -vF "${SOURCE_REGISTRY}/" > "${WORK_DIR}/unmirrored.txt"; then
+    err "Rendered images that were NOT mirrored (check for double prefixes or path changes):"
+    sed 's/^/    /' "${WORK_DIR}/unmirrored.txt" >&2
+    VERIFY_STATUS="failed"
+  fi
+  [[ "$VERIFY_STATUS" == "passed" ]] && ok "Self-check passed: every rendered image resolves to the mirror."
+fi
+
 # ------------------------------------------------------------------- summary ---
 echo
 log "==================== SUMMARY ===================="
 log "Chart mirrored : ${CHART_TARGET_REPO}/${CHART_NAME}:${CHART_VERSION}"
 log "Images copied  : ${COPIED}"
+[[ "$SKIP_EXISTING" == "true" ]] && log "Images skipped : ${SKIPPED} (already in target)"
+log "Self-check     : ${VERIFY_STATUS}"
 if [[ ${#FAILED_IMAGES[@]} -gt 0 ]]; then
   err "Images failed  : ${#FAILED_IMAGES[@]}"
   for i in "${FAILED_IMAGES[@]}"; do err "  - $i"; done
   die "Completed with image copy failures."
 fi
+[[ "$VERIFY_STATUS" == "failed" ]] && die "Completed, but the self-check failed (see above)."
 ok "All done."

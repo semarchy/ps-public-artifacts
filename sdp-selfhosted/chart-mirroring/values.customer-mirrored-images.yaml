@@ -1,5 +1,7 @@
 ## =============================================================================
-## Semarchy Data Platform — customer values.yaml
+## Semarchy Data Platform — customer values.yaml (local registry / air-gapped)
+##
+## Validated against chart: semarchy-data-platform 1.4.2
 ##
 ## Based on the official Azure starter values:
 ##   https://docs.semarchy.com/assets/files/values.azure-*.yaml
@@ -11,8 +13,8 @@
 ##
 ## Assumes images were mirrored preserving their path, e.g. with
 ## mirror-semarchy-chart.sh:
-##   registry.na.semarchy.net/semarchy-release/docker-dm:1.12.1
-##     ->  <YOUR_LOCAL_REGISTRY>/semarchy-release/docker-dm:1.12.1
+##   registry.na.semarchy.net/semarchy-release/docker-dm:1.17.1
+##     ->  <YOUR_LOCAL_REGISTRY>/semarchy-release/docker-dm:1.17.1
 ##
 ## Replace every <YOUR_...> placeholder before use.
 ## =============================================================================
@@ -30,41 +32,57 @@ global:
         body: '<YOUR_LICENSE_KEY_HERE>'
     smartReload:
         enabled: false
+        reloader:
+            # Keep consistent with smartReload.enabled. The chart default is
+            # install: true, so Reloader is still deployed unless this is false.
+            # If you set it to true, keep the "HARD-CODED IMAGE OVERRIDE" for
+            # reloader at the bottom of this file.
+            install: false
     searchEngine:
         type: elasticsearch
 
     ## =========================================================================
     ## >>> LOCAL REGISTRY / IMAGE MIRRORING <<<
     ## -------------------------------------------------------------------------
-    ## `global.image.registry` is prepended to nearly every image in the chart
-    ## and its sub-charts (it is used as
-    ##   {{ .Values.global.image.registry }}/{{ .Values.global.image.repository }}/<image>
-    ## and by the semarchy-common image helper). Point it at your local
-    ## registry BASE (host + any path prefix) where the mirror lives.
+    ## `global.image.registry` is prepended to every Semarchy and mirrored
+    ## third-party image in the chart and its sub-charts, including
+    ## dm.secretManager (since chart 1.4.1) and the CA truststore builder.
+    ## Point it at your local registry BASE (host + any path prefix) where the
+    ## mirror lives.
     ##
     ## Set it to the same base you passed to the mirror script as --target-repo.
     ## Examples:
     ##   registry: 'artifactory.company.com/semarchy'
     ##   registry: 'myregistry.azurecr.io'          # if mirrored to ACR root
     ##
-    ## Keep `repository: semarchy-release` — the mirror preserves that path
-    ## segment (…/semarchy-release/…), so the default value still resolves.
+    ## Keep `repository: semarchy-release`. Several image paths in the chart
+    ## hard-code the `semarchy-release` segment (Keycloak, keycloak-config-cli,
+    ## Envoy, truststore builder, application images), so changing this value
+    ## only moves sdp-infra-tools and well-known-service and breaks the line-up.
     ##
-    ## This single override covers 18 of the 20 images. The 2 images that hard-code
-    ## the source registry (dm.secretManager and reloader) are overridden further
-    ## down in this file — search for "HARD-CODED IMAGE OVERRIDE".
+    ## In chart 1.4.1+ this single override covers 19 of the 20 images. The only
+    ## image that still hard-codes the source registry is Reloader — see
+    ## "HARD-CODED IMAGE OVERRIDE" at the bottom of this file.
     ## =========================================================================
     image:
         registry: '<YOUR_LOCAL_REGISTRY>'      # e.g. artifactory.company.com/semarchy
         repository: 'semarchy-release'
 
-    ## Credentials to pull from the local registry. Create this secret in the
-    ## release namespace beforehand, e.g.:
+    ## Credentials to pull from the local registry. This REPLACES the chart
+    ## default (semarchy-harbor). Create this secret in the release namespace
+    ## beforehand, e.g.:
     ##   kubectl create secret docker-registry local-registry \
     ##     --docker-server=<YOUR_LOCAL_REGISTRY_HOST> \
     ##     --docker-username=<USER> --docker-password=<TOKEN> -n <NAMESPACE>
     imagePullSecrets:
         - name: '<YOUR_LOCAL_REGISTRY_PULL_SECRET>'   # e.g. local-registry
+
+    ## Only if you use global.caCert.enabled=true (private / self-signed CA):
+    ## the truststore builder image defaults to
+    ##   {{ .Values.global.image.registry }}/semarchy-release/mirror/ubi9/openjdk-21-runtime:1.23
+    ## and is therefore repointed automatically. If you override
+    ## global.caCert.initImage or global.caCert.truststore.builderImage, make
+    ## sure those images exist in your local registry too.
 
 ## ------------------------------------------------------------ Tenant setup ---
 tenant-settings:
@@ -155,15 +173,18 @@ dm:
         # Azure Event Hubs uses PLAIN mechanism (default is SCRAM-SHA-512)
         userEventSaslMechanism: PLAIN
 
-    ## === HARD-CODED IMAGE OVERRIDE (1 of 2) ==================================
-    ## dm.secretManager.image.repository hard-codes the FULL source path
-    ## (registry.na.semarchy.net/semarchy-release/docker-secret-manager) and does
-    ## NOT honor global.image.registry, so it must be repointed explicitly.
-    ## Keep the tag managed by the chart; only the repository (registry+path) changes.
-    ## =========================================================================
-    secretManager:
-        image:
-            repository: '<YOUR_LOCAL_REGISTRY>/semarchy-release/docker-secret-manager'
+    ## NOTE — dm.secretManager (chart 1.4.1 and later):
+    ## The image is now rendered as
+    ##   {{ global.image.registry }}/{{ dm.secretManager.image.repository }}:<tag>
+    ## with repository = 'semarchy-release/docker-secret-manager'.
+    ## Do NOT override dm.secretManager.image.repository with a full path any
+    ## more: it would be prefixed twice (<REG>/<REG>/semarchy-release/...) and
+    ## the pod would end in ImagePullBackOff.
+    ##
+    ## Only for chart <= 1.4.0, uncomment the override below:
+    # secretManager:
+    #     image:
+    #         repository: '<YOUR_LOCAL_REGISTRY>/semarchy-release/docker-secret-manager'
 
     core:
         ingress:
@@ -196,11 +217,12 @@ dm:
                     traefik.ingress.kubernetes.io/service.sticky.cookie.httponly: 'true'
 
 ## ------------------------------------------------------------------ Reloader -
-## === HARD-CODED IMAGE OVERRIDE (2 of 2) ======================================
-## The reloader sub-chart cannot build its image from global values, so its
-## repository is hard-coded to registry.na.semarchy.net/... in the chart.
-## Repoint it to the local mirror. Only relevant when
-## global.smartReload.reloader.install is true (Reloader is installed).
+## === HARD-CODED IMAGE OVERRIDE (only one left as of chart 1.4.2) =============
+## The reloader sub-chart (stakater, upstream) cannot build its image from
+## global values, so the parent chart hard-codes
+##   registry.na.semarchy.net/semarchy-release/mirror/stakater/reloader
+## Repoint it to the local mirror. Harmless when
+## global.smartReload.reloader.install is false; required when it is true.
 ## =============================================================================
 reloader:
     image:
